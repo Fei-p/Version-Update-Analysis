@@ -1,0 +1,1219 @@
+---
+title: "Analysis Result"### Code Appendix
+author: Feini Pek
+date: "2025-12-12"
+output: 
+  html_document:
+    theme : cerulean
+    toc: true
+    toc_depth : 6
+    number_sections: no
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = FALSE, echo = FALSE}
+# Load libraries
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(purrr)
+library(rlang)
+library(glmnet)
+library(broom)
+library(scales)
+library(rpart)
+library(rpart.plot)
+library(gbm)
+library(pROC)  
+library(DT)
+library(broom)
+library(knitr)
+library(tibble)
+library(kableExtra)
+```
+
+```{r, echo = FALSE }
+# Load dataset
+data <- read.csv("~/Documents/STA221_Proj/final-version-data-augmented.csv")
+```
+
+```{r, echo = FALSE}
+### Clean and format dataset 
+# Date column
+data$date <- as.Date(data$date, format = "%Y-%m-%d") # Change data type to date time
+data$month <- months(data$date) # add month
+data$initial_version <- as.factor(data$initial_version)
+data$country         <- as.factor(data$country)
+data$is_weekday      <- as.factor(data$is_weekday) 
+```
+
+```{r, echo = FALSE}
+# Subset based on country
+data_germany <- subset(data, country == "Germany")
+data_india <- subset(data, country == "India")
+data_iraq <- subset(data, country == "Iraq")
+data_usa <- subset(data, country == "USA")
+```
+
+### Summary and Descriptive Statistics
+
+- Dataset contains 6782 observations and 39 variables, where each row is one day observation of a user. 
+- Dataset covers 4 countries (Germany, India, Iraq, USA), and covers 2 different update periods (version 1.2.9 and 1.3.3)
+- Timeline covered: The data covers 2024-06-28	2025-02-15	
+
+```{r, echo = FALSE}
+## --- Timeline by version -------------------------
+
+# date range + counts by initial version (1.2.9 vs 1.3.3)
+timeline_by_version <- data %>%
+  group_by(initial_version) %>%
+  summarize(
+    n        = n(),
+    min_date = min(date, na.rm = TRUE),
+    max_date = max(date, na.rm = TRUE),
+    .groups = "drop"
+  )
+knitr::kable(timeline_by_version,
+             caption = "Time covered by version")
+```
+
+- Observation counts for each version 1.2.9 and 1.3.3
+
+```{r, echo = FALSE, fig.width=6, fig.height=6, out.width="60%", fig.align="center"}
+version_counts <- data %>%
+  filter(initial_version %in% c("1.2.9", "1.3.3")) %>%
+  count(initial_version) %>%
+  mutate(
+    prop  = n / sum(n),
+    label = paste0(initial_version, "\n", n, " (", percent(prop, accuracy = 0.1), ")")
+  )
+
+ggplot(version_counts,
+       aes(x = "", y = n, fill = initial_version)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.6),
+            size = 4) +
+  labs(
+    title = "Distribution of observations by initial version",
+    fill  = "Initial version"
+  ) +
+  theme_void()
+
+```
+
+- Observation counts of countries
+
+```{r, echo= FALSE,  fig.width=6, fig.height=6, out.width="60%", fig.align="center"}
+country_counts <- data %>%
+  count(country) %>%
+  mutate(
+    prop  = n / sum(n),
+    label = paste0(country, "\n", n, " (", percent(prop, accuracy = 0.1), ")")
+  )
+
+ggplot(country_counts,
+       aes(x = "", y = n, fill = country)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.5),
+            size = 4) +
+  labs(
+    title = "Distribution of observations by country",
+    fill  = "Country"
+  ) +
+  theme_void()
+```
+
+### Analysis 
+
+Setup for analysis: (define success)
+
+1. Engagement/ behavior: potentially: session_open, session_duration, avg_duration_per_session, avg_page_per_session, total_page, total_click, ad_density, rewarded_ratio
+2. Monetization: ad_revenue
+3. Retention/returning: retention_day
+And the key “treatment” is initial_version (1.2.9 vs 1.3.3), plus controls like country, is_weekday, install_date
+
+### Part 1 - How did the version update change user behavior?
+
+**Main questions:**
+
+- Do users on 1.3.3 behave differently (more sessions, longer duration, more pages) than on 1.2.9, after accounting for country and day / month?
+- Is there a behavior pattern that characterizes “engaged” users?
+
+**Picking key behavior metrics:** 
+
+- session_open
+- avg_duration_per_session
+- avg_page_per_session
+- ad_impression
+- total_click
+- ad_density
+- rewarded_ratio
+
+```{r, include = FALSE}
+# Pick key behavior metrics
+behavior_vars <- c(
+  "session_open",
+  "avg_duration_per_session",
+  "avg_page_per_session",
+  "ad_impression",
+  "total_click",
+  "ad_density",
+  "rewarded_ratio"
+)
+```
+
+**Quick plot of the session per version**
+
+```{r, echo = FALSE, fig.width=6, fig.height=6, out.width="60%", fig.align="center"}
+# Quick plot of the session per version
+ggplot(data,
+       aes(x = initial_version, y = session_open, fill = initial_version)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.4) +
+  labs(x = "Initial version", y = "Number of sessions",
+       title = "Sessions per user by version") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Both versions are very skewed: most users have only a few sessions, but a small group has many sessions (points up to 40). The median and the box for 1.3.3 are slightly higher than for 1.2.9.
+Users on version 1.3.3 tend to open the app slightly more often than users on 1.2.9, although the distribution is very skewed with a few heavy users in both versions.
+
+#### 1.1. Simple regression: effect of version on each behavior
+
+**Method: **
+To compare user behavior between versions we perform
+
+1. Set of simple linear regressions—one for each key behavior metric (sessions, average duration per session, pages, ad impressions, total clicks, ad density, rewarded ratio). 
+2. For each outcome, we modeled behavior as a function of app version (1.3.3 vs 1.2.9), controlling for country and whether the day was a weekday or weekend. 
+3. The coefficient on the 1.3.3 indicator therefore represents the adjusted difference in that behavior between versions: a positive coefficient indicates that, within the same country and day type, users on 1.3.3 show higher levels of that behavior than users on 1.2.9, while a negative coefficient indicates lower levels. 
+4. By collecting these version coefficients and their p-values into a single summary table, this analysis directly addresses our first question of whether 1.3.3 users behave differently from 1.2.9 users after accounting for geography and time, and it highlights which specific behaviors show meaningful changes between versions.
+
+```{r, echo = FALSE}
+# This loop fits a linear model for each behavior variable
+# function to fit lm(behavior ~ version + country + is_weekday)
+fit_behavior_model <- function(var) {
+  formula <- as.formula(paste0(var, " ~ initial_version + country + is_weekday"))
+  lm(formula, data = data)
+}
+
+lm_results <- lapply(behavior_vars, fit_behavior_model)
+names(lm_results) <- behavior_vars
+
+# tidy coefficients into one table
+lm_tidy <- bind_rows(
+  lapply(names(lm_results), function(v) {
+    broom::tidy(lm_results[[v]]) %>%
+      mutate(metric = v)
+  })
+)
+
+# look at version effect only
+version_effects <- lm_tidy %>%
+  filter(grepl("^initial_version", term))
+
+knitr::kable(version_effects,
+             caption = "Table A1: Version effect on behavior with adjusted country and time")
+```
+
+**Result:** 
+
+- session open: On average, users on 1.3.3 have about 0.5 more sessions than 1.2.9 users, controlling for country and month.
+- avg_duration_per_session: 1.3.3 users have shorter sessions than 1.2.9 user
+- avg_page_per_session: 1.3.3 users load ~0.6 fewer pages per session on average
+- ad_impression: 1.3.3 users see about 2–3 more ad impressions on average
+- ad_density: Ads are denser in 1.3.3 (more ad impressions per page/session)
+
+**Conclusion: **
+
+After adjusting for country and calendar effects (month/weekday), version 1.3.3 users show clear differences in behavior relative to 1.2.9. On average, 1.3.3 users open about 0.5 more sessions per user, but each session is shorter and lighter: they spend less time per session and load roughly 0.6 fewer pages per session. Despite lighter sessions, they are exposed to substantially more advertising—the model estimates about 2–3 additional ad impressions per user and a higher ad density (more ads per page/session) on 1.3.3. In contrast, total clicks and the proportion of rewarded vs. non-rewarded ads do not differ significantly between versions. Overall, 1.3.3 appears to encourage more frequent but shallower visits, with a higher concentration of ads, rather than deeper engagement with content.
+
+#### 1.2. PCA on behavior variables (engagement components)
+
+**Method: **
+
+- Take all of the key behavior variables and compress them into a smaller set of “engagement components” using principal component analysis (PCA)
+- First, build a complete-case dataset that keeps only users with non-missing values on all behavior metrics
+- Standardize each metric (center and scale) so that variables on different scales are comparable
+- Run prcomp on this standardized matrix, which finds linear combinations of the original behaviors (principal components) that capture as much of the overall variance as possible while being uncorrelated with each other
+
+```{r, include = FALSE}
+# Make a complete-case dataset for PCA
+analysis_pca <- data %>%
+  select(initial_version, country, is_weekday, all_of(behavior_vars)) %>%
+  drop_na(all_of(behavior_vars))
+```
+
+```{r, echo = FALSE}
+pca_fit <- prcomp(
+  analysis_pca[, behavior_vars],
+  center = TRUE,
+  scale. = TRUE
+)
+
+# variance explained
+#summary(pca_fit)
+
+# loadings
+pca_loadings <- pca_fit$rotation
+knitr::kable(pca_loadings, caption = "Table A2.2: PCA Loadings for Behavioral Metrics")
+```
+```{r}
+# tidy variance explained
+eig_vals <- pca_fit$sdev^2
+pca_summary <- tibble(
+  PC              = paste0("PC", seq_along(eig_vals)),
+  `Std. Dev.`     = eig_vals^0.5,
+  `Prop. Var`     = eig_vals / sum(eig_vals),
+  `Cum. Prop Var` = cumsum(eig_vals / sum(eig_vals))
+)
+
+kable(
+  pca_summary,
+  digits = 3,
+  caption = "Table A2.1: Principal Components Variance Explained"
+)
+```
+
+**PCA loadings output:**
+
+- The first principal component (PC1) has fairly large loadings (in magnitude) on session_open, avg_page_per_session, ad_impression, total_click and ad_density, all with the same sign. Users who open more sessions, view more pages, see more impressions and clicks, and experience denser ads obtain more negative PC1 scores. Because the sign in PCA is arbitrary, we interpret PC1 (up to a sign flip) as a single overall engagement and ad-exposure factor summarizing how intensively a user interacts with the app.
+- The second component (PC2) contrasts different usage styles: session_open loads negatively, whereas avg_page_per_session, avg_duration_per_session and ad_density load positively. Higher PC2 scores therefore correspond to fewer but longer, page-heavy sessions with denser ads, whereas lower PC2 scores indicate many short, lighter sessions.
+PC1 is our main engagement component, explaining about 40% of the total variance in behavior, with PC2 adding another ~23%.
+
+```{r, include = FALSE}
+pca_scores <- as.data.frame(pca_fit$x[, 1:2])
+colnames(pca_scores) <- c("PC1_engagement", "PC2_pattern")
+
+analysis_pca <- bind_cols(analysis_pca, pca_scores)
+```
+
+```{r, echo = FALSE}
+# mean PC scores by version
+analysis_pca %>%
+  group_by(initial_version) %>%
+  summarise(
+    mean_PC1 = mean(PC1_engagement),
+    mean_PC2 = mean(PC2_pattern),
+    .groups = "drop"
+  )
+
+# t-test of PC1 between versions
+t.test(PC1_engagement ~ initial_version, data = analysis_pca)
+
+# optional: boxplot of PC1 by version
+ggplot(analysis_pca,
+       aes(x = initial_version, y = PC1_engagement, fill = initial_version)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(
+    x = "Initial version",
+    y = "PC1 (overall engagement)",
+    title = "Engagement component (PC1) by version"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+PC1 as overall engagement: PC1 combines our seven behavior variables into a single “overall engagement & ad exposure” score, where more negative values correspond to more engaged, ad-heavy users. When we compare mean PC1 by initial version, 1.3.3 users have a lower mean PC1 (–0.23) than 1.2.9 users (0.05), so on average they are more engaged on this component. The Welch t-test confirms that this difference is statistically significant (t $\approx$4.6, p < 0.001), with an estimated mean gap of about 0.27 units on PC1. Given that the standard deviation of PC1 is about 1.7, this corresponds to a small but non-trivial shift (roughly 0.15 SD) toward higher engagement for 1.3.3. The boxplot shows the same pattern: the entire distribution for 1.3.3 is slightly shifted toward more negative PC1 values, although there is still substantial overlap between versions.
+
+Version 1.3.3 is associated with a modest but consistent increase in overall engagement (more sessions/pages/impressions/clicks in combination), not just a change in any single metric.
+
+#### Part 1 summary: 
+
+From the linear models, after adjusting for country and calendar time, version 1.3.3 users do behave differently from 1.2.9 users. They open more sessions on average (about +0.5 sessions), but each session is shorter, with ~0.6 fewer pages per session. At the same time they see substantially more ad impressions and higher ad density, while total clicks and the mix of rewarded vs. non-rewarded ads look very similar across versions. So the update seems to have shifted usage toward more frequent, lighter sessions with more ads per unit of activity.
+
+The PCA then summarizes these multiple behavior metrics into a smaller number of components. PC1 acts as an “overall engagement & ad exposure” score: users with many sessions, pages, impressions, clicks and higher ad density have more negative PC1 values. On this component, 1.3.3 users are significantly more engaged than 1.2.9 users (mean PC1 ≈ –0.23 vs 0.05, p < 0.001), indicating a modest but consistent shift toward higher engagement under the new version. PC2 captures a secondary pattern that contrasts many short, light sessions with fewer but longer, page-heavy sessions; this describes how users engage rather than how much.
+
+In summary, Part 1 shows that the version update nudged users into a different engagement regime—more frequent but shorter sessions and more ad exposure overall—and that we can capture “engaged” users as those on the high-engagement end of PC1. In the next part, we move from behavior to business outcomes: we ask whether these behavioral differences (and engagement components) actually translate into higher ad revenue and better monetization for high-value users.
+
+
+### Part 2 - What predicts monetization (and did the new version help)?
+
+Main questions:
+
+- Which user behaviors are most strongly associated with ad revenue / ARPU?
+- Does 1.3.3 increase revenue after controlling for behavior and country?
+- Are the drivers of monetization different by version?
+
+**Data Prep:**
+
+For the monetization analyses, we first restricted the dataset to users who started on versions 1.2.9 or 1.3.3 and kept only observations with non-missing ad revenue and behavior measures. We retained key covariates (version, country, weekday flag, install date, month) along with seven behavioral metrics (sessions, average duration and pages per session, ad impressions, clicks, ad density, and rewarded-ad ratio). Because ad revenue was highly skewed with many low or zero values, we applied a log-transform using log(1 + revenue) to stabilize variance and make linear modeling more appropriate.
+
+To avoid multicollinearity among the highly correlated behavior variables and to capture overall engagement in a compact way, we ran a principal components analysis (PCA) on the seven behavior metrics. We kept the first two components, interpreting them as an “overall engagement” score (PC1) and a secondary usage pattern (PC2). We flipped the sign of PC1 so that higher values correspond to higher engagement, and then merged these component scores back into the analysis dataset, replacing the original raw behavior variables.
+
+```{r, include = FALSE}
+# Data prep
+set.seed(123)
+
+# 1) focus on the two main versions
+behavior_vars <- c(
+  "session_open",
+  "avg_duration_per_session",
+  "avg_page_per_session",
+  "ad_impression",
+  "total_click",
+  "ad_density",
+  "rewarded_ratio"
+)
+
+monet_data <- data %>%
+  filter(initial_version %in% c("1.2.9", "1.3.3")) %>%
+  mutate(
+    initial_version = factor(initial_version),
+  ) %>%
+  select(
+    ad_revenue,
+    initial_version, country, is_weekday, install_date,month,
+    all_of(behavior_vars)
+  ) %>%
+  drop_na(ad_revenue, all_of(behavior_vars))
+
+# log-transform revenue to reduce skew and handle zeros
+monet_data <- monet_data %>%
+  mutate(log_revenue = log1p(ad_revenue))
+
+```
+
+```{r, echo = FALSE}
+# PCA on behavior vars - engagement components: We’ll compute PCs on the behavior metrics and keep the first two.
+# PCA on behavior variables
+pca_fit_monet <- prcomp(
+  monet_data[, behavior_vars],
+  center = TRUE, scale. = TRUE
+)
+
+# keep first 2 PCs
+pca_scores <- as.data.frame(pca_fit_monet$x[, 1:2])
+colnames(pca_scores) <- c("PC1_engagement", "PC2_pattern")
+
+# OPTIONAL: flip PC1 so higher = more engagement
+pca_scores$PC1_engagement <- -pca_scores$PC1_engagement
+
+monet_data_pca <- bind_cols(
+  monet_data %>% select(-all_of(behavior_vars)),  # drop original behavior vars here
+  pca_scores
+)
+
+datatable(
+  monet_data_pca,
+  caption = "Data for Part 2",
+  options = list(
+    pageLength = 10,   # rows per page
+    lengthMenu = c(10, 25, 50, 100),  # page size choices
+    scrollX = TRUE     # horizontal scroll if many columns
+  )
+)
+```
+
+
+#### 2.1. Ridge and Lasso
+
+Steps:
+
+i). Train/test split (70/30)
+```{r, include = FALSE}
+set.seed(123)
+n <- nrow(monet_data_pca)
+train_idx <- sample(seq_len(n), size = floor(0.7 * n))
+
+train <- monet_data_pca[train_idx, ]
+test  <- monet_data_pca[-train_idx, ]
+```
+
+ii). Build design matrices for glmnet: We include version, country, weekday, month, and the PCs
+```{r, include = FALSE}
+# model formula
+f_monet <- log_revenue ~ initial_version + country + month + is_weekday + PC1_engagement + PC2_pattern
+
+# design matrices (drop intercept column)
+x_train <- model.matrix(f_monet, data = train)[, -1]
+y_train <- train$log_revenue
+
+x_test  <- model.matrix(f_monet, data = test)[, -1]
+y_test  <- test$log_revenue
+```
+
+iii). Ridge regression (alpha = 0)
+```{r, echo = FALSE}
+set.seed(123)
+cv_ridge <- cv.glmnet(x_train, y_train,
+                      alpha = 0,        # ridge
+                      nfolds = 10)
+
+best_lambda_ridge <- cv_ridge$lambda.min
+best_lambda_ridge
+
+ridge_fit <- glmnet(x_train, y_train,
+                    alpha = 0,
+                    lambda = best_lambda_ridge)
+ridge_coefs <- coef(ridge_fit, s = "lambda.min")
+# coefficients (including version effect)
+ridge_coefs
+```
+
+
+```{r}
+# coefficients at lambda.min (use cv_ridge directly)
+#ridge_coefs <- coef(cv_ridge, s = best_lambda_ridge)
+
+coef_tbl <- as.matrix(ridge_coefs) |>
+  as.data.frame() |>
+  rownames_to_column("Term") |>
+  rename(Coefficient = `s1`) |>
+  arrange(desc(abs(Coefficient)))  # optional: sort by magnitude
+
+kable(
+  coef_tbl,
+  digits = 4,
+  caption = "Table B1: Ridge regression coefficients for log-revenue model"
+) |>
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+In the ridge regression, all predictors are retained, but most coefficients are strongly shrunk toward zero. After adjusting for country, month, weekday, and engagement components, the coefficient for version 1.3.3 is essentially zero ($\approx$ –0.0015 on the log-revenue scale), suggesting that the new version does not have an additional direct effect on ad revenue once differences in user behavior and geography are accounted for.
+
+The first engagement component (PC1) remains positively associated with revenue ($\approx$ +1% per one-standard-deviation increase), confirming that more engaged users generate more ad revenue. Country, month, and seasonality effects are more pronounced—for example, June has $\approx$ 30% higher revenue than the reference month, and USA users generate slightly more revenue than the baseline country.
+
+iv). Lasso regression (alpha = 1)
+
+```{r, echo = FALSE}
+set.seed(123)
+cv_lasso <- cv.glmnet(x_train, y_train,
+                      alpha = 1,        # lasso
+                      nfolds = 10)
+
+best_lambda_lasso <- cv_lasso$lambda.min
+best_lambda_lasso
+
+lasso_fit <- glmnet(x_train, y_train,
+                    alpha = 1,
+                    lambda = best_lambda_lasso)
+
+lasso_coefs <- coef(lasso_fit)
+lasso_coefs
+
+```
+
+
+```{r}
+# coefficients at lambda.min
+lasso_coefs <- coef(cv_lasso, s = "lambda.min")
+
+coef_tbl_lasso <- as.matrix(lasso_coefs) |>
+  as.data.frame() |>
+  rownames_to_column("Term") |>
+  rename(Coefficient = `s1`) |>
+  #filter(Coefficient != 0) |>                 # typical for lasso: keep selected terms
+  arrange(desc(abs(Coefficient)))             # optional
+
+kable(
+  coef_tbl_lasso,
+  digits = 4,
+  caption = "Table B.2: Lasso regression coefficients for log-revenue model"
+) |>
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+The lasso model performs automatic variable selection. Under the cross-validated penalty, the lasso retains country, month, weekday, and the two engagement components as important predictors, while shrinking the coefficient for version 1.3.3 exactly to zero. This indicates that once we control for engagement and seasonality, the version indicator does not provide additional predictive information about ad revenue. PC1 (overall engagement) is again positively related to revenue, while PC2 has a small negative effect.
+
+**Ridge & Lasso Summary**
+
+```{r, include = FALSE}
+# same formula as before
+f_monet <- log_revenue ~ initial_version + country + is_weekday + month + PC1_engagement + PC2_pattern
+ols_fit <- lm(f_monet, data = train)
+#summary(ols_fit)
+```
+
+```{r, include = FALSE}
+rmse <- function(y, yhat) {
+  sqrt(mean((y - yhat)^2))
+}
+
+r2 <- function(y, yhat) {
+  1 - sum((y - yhat)^2) / sum((y - mean(y))^2)
+}
+```
+
+```{r, include = FALSE}
+## --- OLS -------------------------------------------------
+
+ols_train_pred <- predict(ols_fit, newdata = train)
+ols_test_pred  <- predict(ols_fit, newdata = test)
+
+ols_rmse_train <- rmse(y_train, ols_train_pred)
+ols_rmse_test  <- rmse(y_test,  ols_test_pred)
+
+ols_r2_train   <- r2(y_train, ols_train_pred)
+ols_r2_test    <- r2(y_test,  ols_test_pred)
+
+## --- Ridge (using ridge_fit already trained with best lambda) ---------
+
+ridge_train_pred <- as.numeric(predict(ridge_fit, newx = x_train))
+ridge_test_pred  <- as.numeric(predict(ridge_fit, newx = x_test))
+
+ridge_rmse_train <- rmse(y_train, ridge_train_pred)
+ridge_rmse_test  <- rmse(y_test,  ridge_test_pred)
+
+ridge_r2_train   <- r2(y_train, ridge_train_pred)
+ridge_r2_test    <- r2(y_test,  ridge_test_pred)
+
+## --- Lasso (using lasso_fit with best lambda) -------------------------
+
+lasso_train_pred <- as.numeric(predict(lasso_fit, newx = x_train))
+lasso_test_pred  <- as.numeric(predict(lasso_fit, newx = x_test))
+
+lasso_rmse_train <- rmse(y_train, lasso_train_pred)
+lasso_rmse_test  <- rmse(y_test,  lasso_test_pred)
+
+lasso_r2_train   <- r2(y_train, lasso_train_pred)
+lasso_r2_test    <- r2(y_test,  lasso_test_pred)
+
+```
+
+```{r, echo = FALSE}
+model_perf <- tibble::tibble(
+  model = c("OLS", "Ridge", "Lasso"),
+  RMSE_train = c(ols_rmse_train, ridge_rmse_train, lasso_rmse_train),
+  RMSE_test  = c(ols_rmse_test,  ridge_rmse_test,  lasso_rmse_test),
+  R2_train   = c(ols_r2_train,   ridge_r2_train,   lasso_r2_train),
+  R2_test    = c(ols_r2_test,    ridge_r2_test,    lasso_r2_test)
+)
+
+knitr::kable(model_perf, caption="Table B.3: Model Performance Comparison (train/test)")
+```
+
+Regression models for ad revenue: 
+
+We used OLS, ridge, and lasso regression to predict log-transformed ad revenue from version, country, month, weekday, and the two engagement components (PC1 and PC2). All three models achieved very similar performance (Table X). Training RMSE was about 0.054 and test RMSE about 0.056 for every model, corresponding to roughly a 5–6% multiplicative error on the log scale. The models explained about 24–25% of the variance in log ad revenue on both the training and test sets ($R^2 \approx$0.24–0.25), and there was no evidence of strong overfitting: train and test metrics were almost identical.
+
+In terms of coefficients, the ridge model kept all predictors but shrank them strongly toward zero. The first engagement component (PC1) remained a positive predictor of revenue (roughly a 1% increase in revenue for a one-standard-deviation increase in engagement), while PC2 had a small negative effect. Country and month showed clear differences (e.g., higher revenue in June and in the US), capturing geographic and seasonal effects. Importantly, the coefficient for version 1.3.3 was essentially zero in the ridge model, and the lasso model shrank it exactly to zero, indicating that once engagement, country, and seasonality are accounted for, the version indicator itself does not add predictive power for ad revenue.
+
+Discussion of regression performance: 
+
+Although the models are stable and interpretable, their predictive power is modest: about three-quarters of the variation in user-level revenue remains unexplained. This is not surprising for monetization data. First, ad revenue is inherently noisy—auction dynamics, which specific ad is served, random user behavior, and other unobserved factors can cause large fluctuations that cannot be predicted from simple engagement summaries. Second, our feature set is limited: we do not include device type, time of day, ad placement, prior history, or user demographics, all of which could explain additional variance. Third, for interpretability we compressed seven behavior variables into only two principal components and used mostly linear effects. This helps with collinearity but inevitably discards some fine-grained patterns and non-linear relationships.
+
+Given these limitations, it is reasonable that linear ridge and lasso regression provide only moderate improvements over OLS and similar overall performance. To better understand monetization patterns, rather than chasing small gains in R² on continuous revenue, we next shift focus to a more business-oriented question: which users are “high value”? In the following section, we define a high-value segment based on the top quartile of ad revenue and apply classification trees and gradient boosting. These models allow non-linear effects and interactions (e.g., between engagement and ad density) and provide variable-importance summaries that are easier to translate into product and monetization strategies.
+
+#### 2.2. Tree for high-value users
+
+**Method:** 
+
+- Define high-value users: Compute the 75th percentile of ad_revenue and create a binary outcome high_value = 1 if a user’s revenue is at or above this cutoff (top 25%), and 0 otherwise.
+- Prepare classification data: Convert high_value and month to factors to use them as a categorical outcome and predictor in classification models.
+- Train/test split: Randomly split the data into a 70% training set and a 30% test set (with a fixed seed for reproducibility) to allow out-of-sample evaluation.
+- Fit classification tree: Train an rpart classification tree to predict high_value from version, country, weekday, month, and the two engagement PCs, using complexity pruning (cp = 0.01) and a minimum leaf size (minbucket = 50) to control overfitting.
+- Evaluate performance: Predict high_value on the test set, compute overall accuracy, and examine the confusion matrix to see how well the tree distinguishes high- vs low-value users.
+
+
+```{r, include = FALSE}
+q75 <- quantile(monet_data_pca$ad_revenue, 0.75)
+
+monet_cls <- monet_data_pca %>%
+  mutate(
+    high_value = ifelse(ad_revenue >= q75, 1, 0),
+    high_value = factor(high_value),
+    month = factor(month)
+  )
+table(monet_cls$high_value)
+```
+
+```{r, include = FALSE}
+set.seed(123)
+n <- nrow(monet_cls)
+train_idx <- sample(seq_len(n), size = floor(0.7 * n))
+
+train_cls <- monet_cls[train_idx, ]
+test_cls  <- monet_cls[-train_idx, ]
+```
+
+**Classification tree**
+
+```{r, echo = FALSE}
+tree_fit <- rpart(
+  high_value ~ initial_version + country + is_weekday +
+    month + PC1_engagement + PC2_pattern,
+  data   = train_cls,
+  method = "class",
+  control = rpart.control(cp = 0.01, minbucket = 50)
+)
+
+rpart.plot(tree_fit)
+```
+
+Interpretation: 
+
+1. Root node (0 / 0.25 / 100%): using all users, 25% are high-value, so the majority class is 0 (not high-value)
+2. First split (PC1_engagement < 0.34):
+
+   - Left branch (low engagement, < 0.34), Leaf: 0 / 0.17 / 72%. 
+     About 72% of users fall here; only 17% are high-value - the tree predicts class 0.
+     Interpretation: Most low-engagement users are not high-value.
+   - Right branch (higher engagement, ≥ 0.34), Node: 0 / 0.46 / 28%
+     28% of users; here, 46% are high-value, so high engagement already roughly doubles the chance of being
+     high-value vs the baseline (25%). This node then splits on country and PC1_engagement again.
+   - Among higher-engagement users:
+     The tree splits on country = India/Iraq vs others, and then on very high PC1_engagement.
+     One leaf (rightmost, green the plot) is labeled 1 / 0.72 / 8%:
+     About 8% of all users fall in this segment. In this segment, 72% are high-value (this is the “premium” group).
+     Another leaf (light green) labeled 1 / 0.56 / 3%: 3% of users, 56% are high-value.
+     
+Qualitative story:
+
+1. The main driver is overall engagement (PC1):
+   - Low PC1 → low chance of being high-value (17% vs baseline 25%).
+   - High PC1 → much higher chance (~46% on average, up to 56–72% in certain segments).
+2. Within high-engagement users, country and extreme levels of engagement further separate the very high-value segments.
+3. Version does not appear as a split - it’s not one of the most important variables for classifying high-value users.
+
+**Accuracy**
+```{r, echo = FALSE}
+tree_pred <- predict(tree_fit, newdata = test_cls, type = "class")
+
+# accuracy
+mean(tree_pred == test_cls$high_value)
+
+# confusion matrix
+table(Predicted = tree_pred, Actual = test_cls$high_value)
+
+```
+
+- Accuracy $\approx$ 0.78 (78% of test users correctly classified)
+- Specificity ~95%: 1291 / (1291+66))
+- Sensitivity ~27%: 121 / (121+331)
+
+So the tree is: very good at identifying non–high-value users and more conservative on high-value users. That’s a common pattern when using a 0.5 threshold with imbalanced data: the model prefers to avoid false positives.
+
+**Conclusion:** (Classification tree for high-value users)
+
+We defined a high-value segment as users in the top quartile of ad revenue and trained a classification tree using version, country, month, weekday, and the engagement components as predictors. The resulting tree first splits on the overall engagement component (PC1), indicating that engagement is the primary determinant of user value. Low-engagement users (PC1 < 0.34, ≈72% of users) have only a 17% chance of being high-value, below the overall base rate of 25%. Among higher-engagement users (PC1 ≥ 0.34), the tree further splits on country and very high engagement levels, identifying small segments (3–8% of the population) where 56–72% of users are high-value. The version indicator does not appear in the tree, suggesting that it is not among the most important variables for distinguishing high-value users.
+
+On the test set, the tree achieves an accuracy of about 78%, slightly improving on the trivial baseline of always predicting non–high-value ($\approx$75%). More importantly, it yields interpretable rules that highlight which combinations of engagement and geography are associated with a substantially higher probability of being high-value.
+
+
+#### 2.3. Boosting model (gbm)
+
+Method: 
+
+- Recode outcome for GBM: Convert high_value from a factor (0/1) into a numeric 0/1 variable in the training and test sets, since gbm with distribution = "bernoulli" expects a numeric binary outcome.
+- Specify predictors and model family: Fit a gradient boosting model (GBM) with high_value as the outcome and version, country, weekday, month, and the two engagement components (PC1, PC2) as predictors, using a Bernoulli (logistic) loss for binary classification.
+- Set boosting hyperparameters: Use up to 2,000 trees, tree depth 3 (to allow limited interactions), a small learning rate (shrinkage = 0.01), and a minimum node size of 30, with 5-fold cross-validation to control overfitting.
+- Choose the optimal number of trees: Use gbm.perf(..., method = "cv") to select the number of trees that minimizes cross-validated deviance, and fix this as best_trees for all subsequent predictions.
+- Predict probabilities on the test set: Compute predicted probabilities of being high-value (gbm_prob) for each user in the test set using the fitted GBM with n.trees = best_trees.
+- Classify and compute accuracy: Threshold the probabilities at 0.5 to obtain predicted high-value labels (0/1), then compare them to the true labels in test_gbm to calculate overall classification accuracy.
+- Evaluate ranking performance (AUC): Use the predicted probabilities and true labels to compute the area under the ROC curve (AUC), summarizing how well the GBM ranks high-value users above low-value users.
+
+**Plot**
+```{r, echo = FALSE}
+# note: gbm wants the outcome as numeric 0/1
+train_gbm <- train_cls %>%
+  mutate(high_value = as.numeric(as.character(high_value)))
+test_gbm <- test_cls %>%
+  mutate(high_value = as.numeric(as.character(high_value)))
+
+set.seed(123)
+gbm_fit <- gbm(
+  formula = high_value ~ initial_version + country + is_weekday +
+    month + PC1_engagement + PC2_pattern,
+  data         = train_gbm,
+  distribution = "bernoulli",
+  n.trees      = 2000,
+  interaction.depth = 3,
+  shrinkage    = 0.01,
+  n.minobsinnode = 30,
+  cv.folds     = 5,
+  verbose      = FALSE
+)
+
+best_trees <- gbm.perf(gbm_fit, method = "cv")  # chooses best #trees
+best_trees
+
+```
+
+Training vs CV Bernoulli deviance:
+- Black curve = training deviance (loss on the training data).
+It keeps going down as you add more trees - the model is fitting the training data better and better.
+
+- Green curve = cross-validated deviance (average loss on held-out folds).
+It drops quickly at first, then flattens, and eventually starts to creep up a bit.
+
+As we add more trees, the model initially gets better on unseen data, but after ~1170 trees additional trees mostly overfit. We therefore use 1170 trees as the optimal complexity for the GBM classifier.
+
+**Accuracy**
+```{r, echo=FALSE}
+# predicted probabilities
+gbm_prob <- predict(gbm_fit, newdata = test_gbm,
+                    n.trees = best_trees, type = "response")
+
+# classify at 0.5 threshold
+gbm_pred <- ifelse(gbm_prob > 0.5, 1, 0)
+
+# accuracy
+mean(gbm_pred == test_gbm$high_value)
+
+# AUC (how well the probabilities rank high vs low value)
+roc_obj <- roc(response = test_gbm$high_value, predictor = gbm_prob)
+auc(roc_obj)
+
+```
+
+- Accuracy $\approx$ 0.787 - about 79% of test users correctly classified as high vs low value. Baseline “always predict low value” accuracy is ~75%, so GBM gives a modest improvement in raw accuracy.
+- AUC $\approx$ 0.786 - if you take a random high-value user and a random low-value user, the model assigns the higher predicted probability to the high-value user about 79% of the time. AUC > 0.7 is generally considered reasonably good; 0.5 would be random.
+
+So GBM has similar accuracy to the single tree (~78%) but noticeably better ranking quality, which is exactly what AUC measures. For monetization, ranking users by “likelihood of being high value” is often more useful than a strict 0/1 label.
+
+**GBM Summary**
+```{r, echo = FALSE}
+summary(gbm_fit)   # relative influence plot
+```
+
+```{r}
+rel_tbl <- summary(gbm_fit, plotit = FALSE) %>%   # returns data.frame(var, rel.inf)
+  as_tibble() %>%
+  arrange(desc(rel.inf)) %>%
+  mutate(rel.inf = round(rel.inf, 2)) %>%
+  rename(`Relative influence (%)` = rel.inf,
+         Variable = var)
+
+kable(
+  rel_tbl,
+  caption = "Table B4: GBM relative influence (variable importance)",
+  align = c("l","r")
+) %>%
+  kable_styling(full_width = FALSE,
+                bootstrap_options = c("striped","hover","condensed"))
+```
+
+- PC1_engagement (~45%) is by far the most important predictor: overall engagement is the main driver of whether someone is high value.
+- PC2_pattern (~27%) and country (~22%) are also substantial: finer-grained behavior patterns and geography both matter.
+- Month (~4–5%) has a small but non-trivial effect (seasonality).
+- Version (~0.8%) and weekday (~0.3%) have very little influence:
+
+GBM is telling the same story as ridge/lasso and the tree: the version indicator adds almost no predictive power for high-value status once behavior and country are accounted for.
+
+
+#### Part 2 SUMMARY – What predicts monetization, and did the new version help?
+
+To study monetization, we modeled log-transformed ad revenue using ridge, lasso, and OLS regression with version, country, calendar effects, and two engagement components (PC1, PC2) as predictors. All three models had similar performance (test RMSE ≈ 0.056 and R² ≈ 0.25), indicating that they explain about one quarter of the variation in user-level revenue and do not overfit. In every model, the first engagement component (PC1, capturing overall usage and ad exposure) was a strong positive predictor of revenue, while PC2 had a smaller negative effect. Country and month showed clear differences (e.g., higher revenue in June and in the US), reflecting geographic and seasonal effects. In contrast, the coefficient for version 1.3.3 was essentially zero in ridge and dropped to exactly zero in lasso, suggesting that after adjusting for behavior, country, and seasonality, the new version does not have an additional direct effect on revenue.
+
+Because exact revenue is noisy and only moderately predictable with linear models, we reframed the problem to focus on identifying high-value users (top 25% of revenue). A classification tree using the same predictors achieved about 78% accuracy on the test set. The tree’s first split was on PC1_engagement, and low-engagement users had only a 17% chance of being high value (below the 25% base rate). Among higher-engagement users, the tree further split on country and very high engagement levels, isolating small segments where 56–72% of users are high value. Version did not appear as a split, again implying that it is not among the most important factors distinguishing high- vs low-value users.
+
+We then fit a gradient boosting model (GBM) to capture non-linear effects and interactions. Using cross-validation, the optimal model used ~1,170 trees and achieved ~79% test accuracy with an AUC of ~0.79, slightly improving on the single tree and the baseline that always predicts low value. Variable-importance estimates showed that PC1_engagement (≈45% relative influence), PC2_pattern (≈27%), and country (≈22%) are the dominant drivers of high-value status, while month contributes modestly and version and weekday have negligible influence (<1%). Overall, monetization is primarily driven by engagement level and geography rather than the version update, and the relationship between behavior and revenue appears broadly similar across versions.
+
+
+### Part 3 - User retention
+
+1. Who sticks around?
+- Which behaviors and contexts predict whether a user is still around after some time?
+- Predictors: engagement pattern, country, month/weekday, etc.
+
+2. Did the new version help retention?
+- After controlling for behavior and context, do users who started on 1.3.3 have higher (or lower) probability of being retained than users on 1.2.9?
+- This is the retention analogue of what we did for revenue.
+
+```{r, include = FALSE}
+behavior_vars <- c(
+  "session_open",
+  "avg_duration_per_session",
+  "avg_page_per_session",
+  "ad_impression",
+  "total_click",
+  "ad_density",
+  "rewarded_ratio"
+)
+
+retention_data <- data %>%
+  filter(initial_version %in% c("1.2.9", "1.3.3")) %>%
+  mutate(
+    initial_version = factor(initial_version),
+    country         = factor(country),
+    is_weekday      = factor(is_weekday),
+    month           = factor(month),
+    # define D7 retention – tweak threshold if needed
+    retained_D7     = if_else(retention_day >= 7, 1L, 0L)
+  ) %>%
+  select(
+    retained_D7,
+    initial_version, country, month, is_weekday,
+    all_of(behavior_vars)
+  ) %>%
+  drop_na(retained_D7, all_of(behavior_vars))
+
+# PCA on engagement vars
+pca_ret <- prcomp(
+  retention_data[, behavior_vars],
+  center = TRUE, scale. = TRUE
+)
+
+pca_scores_ret <- as.data.frame(pca_ret$x[, 1:2])
+colnames(pca_scores_ret) <- c("PC1_engagement", "PC2_pattern")
+
+# OPTIONAL: flip PC1 so higher = more engagement
+pca_scores_ret$PC1_engagement <- -pca_scores_ret$PC1_engagement
+
+retention_pca <- bind_cols(
+  retention_data %>% select(-all_of(behavior_vars)),
+  pca_scores_ret
+)
+#head(retention_pca)
+```
+
+#### 3.1. Logistic model
+
+**Model fitting result**
+```{r, include = FALSE }
+set.seed(123)
+n <- nrow(retention_pca)
+train_idx <- sample(seq_len(n), size = floor(0.7 * n))
+
+train_ret <- retention_pca[train_idx, ]
+test_ret  <- retention_pca[-train_idx, ]
+```
+
+```{r, echo = FALSE}
+# logistic model (logit link)
+logit_ret <- glm(
+  retained_D7 ~ initial_version + country + month + is_weekday +
+    PC1_engagement + PC2_pattern,
+  data   = train_ret,
+  family = binomial()
+)
+
+summary(logit_ret)
+```
+
+
+```{r, echo = FALSE}
+tab <- tidy(logit_ret) %>%
+  select(term, estimate, std.error, statistic, p.value) %>%
+  rename(
+    Term = term,
+    Estimate = estimate,
+    `Std. Error` = std.error,
+    `z value` = statistic,
+    `P-value` = p.value
+  )
+
+kable(
+  tab,
+  digits = 4,
+  caption = "Table C1: Logistic regression summary (logit link)"
+) %>%
+  kable_styling(full_width = FALSE,
+                bootstrap_options = c("striped","hover","condensed"))
+
+```
+
+- Outcome = retained_D7 (1 if retention_day $\geq$ 7, 0 otherwise)
+- Predictors = version, country, month, weekday, PC1_engagement, PC2_pattern.
+
+Note: coefficients are on the log-odds scale; the or_table shows odds ratios (exponentiated coefficients).
+
+1. Version effect
+- initial_version1.3.3
+- Coefficient $\approx$ −21.9, p = 0.92
+- Odds ratio $\approx$ 3.0e-10 with a huge confidence interval - this is numerically unstable (likely due to very few events in some version–month combinations), but the p-value is large.
+- Interpretation: once we control for country, calendar effects, and engagement, we find no evidence that starting on version 1.3.3 changes D7 retention compared to 1.2.9. The gigantic OR is just a symptom of sparse data, not a meaningful effect.
+
+2. Country
+- countryIraq, Coefficient $\approx$ −0.62, p $\approx$ 0.008: Odds ratio $\approx$ 0.54 - users from Iraq have about 46% lower odds of being retained at D7 than users in the reference country (holding other variables fixed).
+- countryIndia, OR $\approx$ 1.38, p $\approx$ 0.14 - trend toward higher retention but not statistically significant.
+- countryUSA, OR $\approx$ 1.04, p $\approx$ 0.84 - essentially no difference from the reference country.
+
+3. Month / calendar effects
+- monthJuly, Coefficient ≈ −1.27, p < 1e-12: Odds ratio ≈ 0.28 → users who installed in July have about 72% lower odds of D7 retention than the reference month. Other months (January, February, June, December) have very large ORs but also huge standard errors and non-significant p-values - estimates are unstable due to small counts and we do not interpret them.
+
+4. Engagement components
+- PC1_engagement, Coefficient ≈ −0.40, p < 2e-16: Odds ratio $\approx$ 0.67 (95% CI roughly 0.63–0.72).
+- Interpretation: for a one-SD increase in PC1, the odds of D7 retention multiply by 0.67 ($\approx$33% lower). Equivalently, a one-SD more favorable engagement pattern (moving in the opposite direction on PC1) corresponds to roughly 1.5× higher odds of being retained at D7.
+- This is the strongest predictor in the model.
+
+**Odd-ratio Table:**
+
+```{r, warning= FALSE, echo = FALSE}
+or_table <- tidy(logit_ret, exponentiate = TRUE, conf.int = TRUE)
+or_table
+```
+
+```{r, echo = FALSE}
+knitr::kable(or_table, caption= "Table C2: Odd-ratio")
+```
+
+**Accuracy and AUC:**
+
+```{r, echo = FALSE}
+# predicted probabilities on test set
+test_prob <- predict(logit_ret, newdata = test_ret, type = "response")
+
+# classify using 0.5 threshold
+test_pred <- ifelse(test_prob > 0.5, 1, 0)
+
+# accuracy
+mean(test_pred == test_ret$retained_D7)
+
+# confusion matrix
+table(Predicted = test_pred, Actual = test_ret$retained_D7)
+
+# AUC
+roc_logit <- roc(response = test_ret$retained_D7, predictor = test_prob)
+auc(roc_logit)
+
+```
+
+- Test accuracy = 0.764.
+- Sensitivity/recall for retained users: 447 / 800$\approx$0.56
+- Specificity for not-retained: 933 / 1006$\approx$0.93
+- Precision for the “retained” prediction: 447 / (447 + 73$\approx$0.86
+- AUC = 0.852 → the model is very good at ranking users by retention risk: a randomly chosen retained user has about an 85% chance of getting a higher predicted probability than a randomly chosen non-retained user.
+
+**Conclusion:** Logistic model for D7 retention.
+
+We modeled the probability of being retained at day 7 (retained_D7 = 1 if retention_day $\geq$ 7, 0 otherwise) using a logistic regression with version, country, month, weekday, and the two engagement components as predictors. The model reduced the deviance by about one third relative to the null model (pseudo-Rsq $\approx$ 0.34) and performed well on the test set, achieving about 76% accuracy compared to a ≈56% baseline from always predicting non-retention, and an AUC of 0.85, indicating strong ability to rank users by retention risk. The strongest predictor of D7 retention was the overall engagement component (PC1): a one–standard deviation increase in PC1 was associated with roughly a 33% decrease in the odds of retention (OR $\approx$ 0.67, p < 0.001), implying that users with more favorable engagement patterns (the opposite direction on PC1) have about 1.5× higher odds of being retained. Users from Iraq showed substantially worse retention than the reference country (OR $\approx$ 0.54, p $\approx$ 0.008), whereas India and the USA did not differ significantly. We also observed a strong calendar effect for July (OR $\approx$ 0.28, p < $10^{-12}$), suggesting much poorer retention for users who installed in that month. After adjusting for these factors, the indicator for version 1.3.3 was not significant (p$\approx$0.92), suggesting that the version update does not have a detectable direct effect on D7 retention, and that differences in retention are driven primarily by engagement and, to a lesser extent, by geography and time of installation.
+
+#### 3.2. Tree for high-retention users
+
+**Tree plot**
+```{r}
+tree_ret <- rpart(
+  retained_D7 ~ initial_version + country + month + is_weekday +
+    PC1_engagement + PC2_pattern,
+  data   = train_ret,
+  method = "class",
+  control = rpart.control(cp = 0.01, minbucket = 50)
+)
+
+rpart.plot(tree_ret)
+```
+
+- Root split – calendar effect.
+The first split is on month = June or July. Users who installed in June or July are sent to the left leaf, where the model predicts “not retained” with relatively low D7 retention (about 32%) and this group accounts for ~58% of users. This reinforces the strong seasonal effect we saw in the logistic model: summer installs have poor retention regardless of other factors.
+
+- Non-summer users – version effect.
+For users who did not install in June/July, the next split is on initial_version = 1.3.3.
+
+- The rightmost leaf (non-summer + version 1.3.3) has a predicted retention probability around 0.89 and contains about 25% of users. This segment is classified as “retained” and suggests that users starting on version 1.3.3 outside the summer months have very high D7 retention.
+
+- The left child (non-summer + version 1.2.9) is further split by month = January: outside January, retention is extremely low (about 2%), while January users are split again by PC1_engagement. Among January 1.2.9 users, those with higher engagement (PC1 ≥ −0.11) have moderate retention (~0.63), whereas those with lower engagement have much poorer retention (~0.36).
+
+**Accuracy:**
+
+```{r}
+tree_ret_pred <- predict(tree_ret, newdata = test_ret, type = "class")
+mean(tree_ret_pred == test_ret$retained_D7)
+table(Predicted = tree_ret_pred, Actual = test_ret$retained_D7)
+
+```
+
+On the test set, the tree achieves about 75% accuracy (confusion matrix: TN = 913, FP = 93, FN = 351, TP = 449), which is slightly below but very close to the logistic model’s 76% accuracy. So the tree does not improve predictive performance, but it provides simple, visual rules that are easy to explain to a product team: avoid launching key campaigns in June/July, and retention is especially strong for non-summer users on the new version, with engagement further boosting retention in some segments.
+
+#### 3.3. Boosting model (gbm)
+
+**Plot**
+```{r, echo = FALSE}
+train_gbm_ret <- train_ret %>%
+  mutate(retained_D7 = as.numeric(retained_D7))
+
+test_gbm_ret <- test_ret %>%
+  mutate(retained_D7 = as.numeric(retained_D7))
+
+set.seed(123)
+gbm_ret <- gbm(
+  retained_D7 ~ initial_version + country + month + is_weekday +
+    PC1_engagement + PC2_pattern,
+  data         = train_gbm_ret,
+  distribution = "bernoulli",
+  n.trees      = 2000,
+  interaction.depth = 3,
+  shrinkage    = 0.01,
+  n.minobsinnode = 30,
+  cv.folds     = 5,
+  verbose      = FALSE
+)
+
+best_trees_ret <- gbm.perf(gbm_ret, method = "cv")  # choose #trees
+best_trees_ret
+
+```
+
+The black curve is the training Bernoulli deviance and the green curve is the cross-validated deviance as the number of trees increases. Both drop quickly at the beginning and then flatten out. The dashed blue line around ~1,400 trees is where the cross-validated deviance is smallest, so that’s the number of boosting iterations we keep. The fact that the CV curve levels off and doesn’t start rising shows we’ve controlled overfitting reasonably well: the model is complex, but not just memorising the training data.
+
+**Accuracy**
+```{r, echo = FALSE}
+gbm_prob_ret <- predict(gbm_ret, newdata = test_gbm_ret,
+                        n.trees = best_trees_ret, type = "response")
+
+gbm_pred_ret <- ifelse(gbm_prob_ret > 0.5, 1, 0)
+
+# accuracy
+mean(gbm_pred_ret == test_gbm_ret$retained_D7)
+
+# AUC
+roc_gbm_ret <- roc(response = test_gbm_ret$retained_D7, predictor = gbm_prob_ret)
+auc(roc_gbm_ret)
+
+```
+
+On the test set, classifying at a 0.5 probability threshold gives an accuracy of about 0.77, meaning the model correctly predicts 7-day retention for roughly 77% of users. More importantly, the AUC ≈ 0.86 indicates very good ranking performance: if you randomly pick one retained and one non-retained user, there’s about an 86% chance the model assigns a higher probability to the retained one. So, compared with the logistic model and the single tree, boosting gives a small but meaningful improvement in how well we can separate “will come back by D7” from “will not”.
+
+**GBM summary**
+
+```{r, echo=FALSE}
+summary(gbm_ret)  # barplot + table of relative influence
+```
+
+```{r}
+rel_tbl2 <- summary(gbm_ret, plotit = FALSE) %>%   # returns data.frame(var, rel.inf)
+  as_tibble() %>%
+  arrange(desc(rel.inf)) %>%
+  mutate(rel.inf = round(rel.inf, 2)) %>%
+  rename(`Relative influence (%)` = rel.inf,
+         Variable = var)
+
+kable(
+  rel_tbl2,
+  caption = "Table C2: GBM relative influence (variable importance)",
+  align = c("l","r")
+) %>%
+  kable_styling(full_width = FALSE,
+                bootstrap_options = c("striped","hover","condensed"))
+```
+
+
+
+The variable-importance table tells us which predictors the boosted trees rely on most. Month has the highest relative influence (~32%), followed closely by initial_version (~30%) and PC1_engagement (~26%). That means calendar timing, version, and overall engagement behaviour are the main drivers of D7 retention in this model. PC2_pattern has a moderate effect, while country and is_weekday contribute only a small amount. This lines up nicely with the earlier tree: retention is much worse in June/July, and among other months, being on version 1.3.3 and having higher engagement (PC1) is associated with a higher probability of staying.
+
+**Conclusion:** 
+
+Boosted trees suggest that D7 retention is driven by a combination of seasonality, app version, and engagement. Users on version 1.3.3 outside the low-retention summer months, who show stronger engagement patterns, are much more likely to return by Day 7. Country and weekday/weekend play a comparatively minor role once these factors are taken into account.” This gives you a nice story: the update seems helpful for retention, but its effect depends on when users install and how engaged they are, and there are strong seasonal effects that the business should keep in mind when evaluating any version change.
+
+#### Part 3 SUMMARY – User Retention
+
+- Regression view (logit model). When we model D7 retention with a logistic regression, the strongest effects come from engagement and timing, not the version itself. Higher values on the engagement PC (which correspond to lower overall engagement) are associated with substantially lower odds of being retained by Day 7, and July in particular shows much worse retention than other months. After adjusting for these factors (plus country and weekday/weekend), the main effect of version 1.3.3 is small and not statistically distinguishable from 1.2.9.
+
+- Tree segmentation. The classification tree turns this into simple rules: users who install in June/July are mostly predicted to churn, regardless of version. Outside these low-retention months, being on version 1.3.3 and having at least moderate engagement (PC1 above a small threshold) leads to the highest predicted retention probabilities (around 0.6–0.9), while low-engagement users and those on 1.2.9 have noticeably lower chances of coming back by Day 7. The tree achieves ~75% test accuracy, showing these simple splits capture a lot of the retention pattern.
+
+- Boosting & variable importance. The boosted trees (GBM) improve predictive performance slightly (test accuracy ≈ 0.77, AUC ≈ 0.86) and confirm the same story. Month, initial_version, and engagement PC1 are the three most influential predictors, with country and weekday playing much smaller roles. In other words, D7 retention is driven by a combination of seasonality, overall engagement behaviour, and version update: the new version 1.3.3 seems to help retention, but mainly outside the low-retention summer months and particularly for users who are already more engaged.
+
+### Part 4 : Bootstrap
+
+Steps:
+
+- Select versions and metric:For a given behavior metric (e.g., sessions, revenue), we restrict the data to the two target versions (1.2.9 and 1.3.3) and drop any rows with missing values on that metric or the version variable.
+- Extract group samples: We split the metric into two vectors: x1 for version 1.2.9 and x2 for version 1.3.3, and record their sample sizes n1, n2.
+- Compute the observed mean difference: We calculate the observed difference in means, defined as version 1.3.3 mean minus version 1.2.9 mean.
+- Bootstrap resampling within each version: We run a bootstrap with B=2000): in each iteration, we resample n1 observations with replacement from x1 and n2 observations with replacement from x2. compute their means, and store the bootstrap difference in means. This yields a bootstrap distribution of mean differences.
+- Construct a 95% confidence interval: We take the 2.5th and 97.5th percentiles of the bootstrap differences to form a percentile-based 95% confidence interval for the mean difference between versions.
+- Estimate a two-sided p-value: We approximate a two-sided p-value by asking how often the bootstrap differences lie on each side of zero and doubling the smaller tail probability.
+- Summarize results for one metric: For each metric, we return a row with the metric name, mean in 1.2.9, mean in 1.3.3, the observed difference (1.3.3 − 1.2.9), the 95% CI, and the bootstrap p-value.
+- Apply to multiple metrics: We repeat this procedure for each metric in a predefined list (sessions, duration, pages, clicks, ad clicks, ad revenue) using map_dfr, and stack the results into a single summary table, optionally rounding numeric values and renaming columns for clarity.
+
+```{r, include = FALSE}
+# data  : data frame (e.g., combined_all)
+# metric: column with the metric to compare (bare name, not string)
+# group_var: version variable (default = initial_version)
+# group1, group2: the two versions to compare
+bootstrap_diff_mean <- function(data,
+                                metric,
+                                group_var = initial_version,
+                                group1 = "1.2.9",
+                                group2 = "1.3.3",
+                                B = 2000,
+                                seed = 123) {
+  metric_sym    <- rlang::ensym(metric)
+  group_var_sym <- rlang::ensym(group_var)
+  
+  # keep only the two versions and non-missing values
+  df <- data %>%
+    filter(!!group_var_sym %in% c(group1, group2)) %>%
+    drop_na(!!metric_sym, !!group_var_sym)
+  
+  x1 <- df %>% filter(!!group_var_sym == group1) %>% pull(!!metric_sym)
+  x2 <- df %>% filter(!!group_var_sym == group2) %>% pull(!!metric_sym)
+  
+  n1 <- length(x1); n2 <- length(x2)
+  
+  # observed difference in means (group2 - group1)
+  obs_diff <- mean(x2) - mean(x1)
+  
+  if (!is.null(seed)) set.seed(seed)
+  
+  # bootstrap resampling
+  boot_diffs <- replicate(B, {
+    m1 <- mean(sample(x1, n1, replace = TRUE))
+    m2 <- mean(sample(x2, n2, replace = TRUE))
+    m2 - m1
+  })
+  
+  # 95% CI from bootstrap distribution
+  ci <- quantile(boot_diffs, c(0.025, 0.975))
+  
+  # two-sided p-value: how often the bootstrap difference crosses 0
+  p_val <- 2 * min(mean(boot_diffs >= 0),
+                   mean(boot_diffs <= 0))
+  
+  tibble(
+    metric      = rlang::as_string(metric_sym),
+    group1      = group1,
+    group2      = group2,
+    mean_g1     = mean(x1),
+    mean_g2     = mean(x2),
+    obs_diff    = obs_diff,
+    ci_lower    = ci[1],
+    ci_upper    = ci[2],
+    p_value     = p_val
+  )
+}
+```
+
+```{r, include = FALSE}
+metrics <- c(
+  "session_open",
+  "session_duration",
+  "total_page",
+  "total_click",
+  "ad_click",
+  "ad_revenue"
+)
+
+boot_results <- metrics %>%
+  map_dfr(~ bootstrap_diff_mean(data, !!sym(.x))) %>%
+  # (optional) round numbers for nicer display
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  # (optional) rename columns to be clearer in the table
+  rename(
+    mean_1.2.9 = mean_g1,
+    mean_1.3.3 = mean_g2,
+    diff_1.3.3_minus_1.2.9 = obs_diff
+  )
+```
+
+```{r, echo = FALSE}
+boot_results
+```
+
+Using a non-parametric bootstrap, we compared key metrics between users whose initial version was 1.2.9 and 1.3.3. For each metric, we resampled users with replacement within each version and computed the difference in mean values (1.3.3 − 1.2.9) across 2,000 bootstrap iterations to obtain 95% confidence intervals.
+
+The results suggest that version 1.3.3 is associated with more sessions per user–day (mean difference ≈ 0.47 sessions, 95% CI [0.34, 0.61]) and more pages viewed (mean difference ≈ 1.15 pages, 95% CI [0.53, 1.80]). In contrast, there is no clear evidence of a change in average session duration or total clicks, as the bootstrap confidence intervals for these metrics include zero.
+
+For monetization, 1.3.3 shows a substantial increase in ad engagement and revenue: users generate about 0.49 more ad clicks per day on average (95% CI [0.40, 0.58]) and about 0.017 higher ad revenue per day (95% CI [0.011, 0.022]) compared to 1.2.9. Overall, the bootstrap analysis supports that the update is associated with higher session frequency, page consumption, and especially ad monetization, rather than longer sessions.
+
+
+### Code Appendix
+```{r getlabels, echo = FALSE}
+labs = knitr::all_labels()
+labs = labs[!labs %in% c("setup","getlabels","allcode")]
+```
+
+```{r all code, ref.label = labs, eval = FALSE}
+```
