@@ -9,6 +9,7 @@ We study how the update changed user behavior, monetization, and retention acros
 4. lasso.py: Builds LASSO models to identify drivers of ad revenue separately for each country (e.g., page_home, session_open, ad_density, rewarded_ratio, etc.), Standardizes features, uses cross-validated LASSO, and prints non-zero coefficients as the main drivers.
 5. pca.py: Runs PCA on behavioral features (session frequency, depth, ad density, page views, CTR, etc.) for USA vs India, produces a 2D PC scatterplot and loading table to visualize cross-market behavioral patterns.
 6. decision tree.py: Fits a shallow decision tree (regressor) relating revenue to core behavioral features (e.g., page_home, ad_density, avg_duration_per_session) for a single country, exports tree rules and a visualization that highlights key behavioral thresholds.
+7. App_analysis_report.pdf: Compiled report of the results
 
 #### Reproducing the R analysis
 - Open the project folder in RStudio.
